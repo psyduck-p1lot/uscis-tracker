@@ -1,0 +1,40 @@
+name: USCIS Daily Fetch
+
+on:
+  schedule:
+    - cron: "0 10 * * *"   # Daily 10:00 AM UTC
+  workflow_dispatch:         # Allow manual trigger from GitHub UI
+
+jobs:
+  fetch-and-predict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120     # Hard stop at 2 hours (covers up to ~7,200 receipts)
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run fetch_cases.py
+        env:
+          SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python fetch_cases.py
+
+      - name: Run predict.py
+        env:
+          SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python predict.py
