@@ -2,22 +2,22 @@ name: USCIS 821-D Daily Fetch
 
 on:
   schedule:
-    - cron: "0 10 * * *"   # Daily 10:00 AM UTC
-  workflow_dispatch:         # Manual trigger from GitHub Actions UI
+    - cron: "0 10 * * *"
+  workflow_dispatch:
     inputs:
       ioe_start:
-        description: "IOE suffix start (10 digits, e.g. 2490100001)"
+        description: "IOE suffix start (10 digits)"
         required: false
         default: ""
       ioe_end:
-        description: "IOE suffix end (10 digits, e.g. 2490199999)"
+        description: "IOE suffix end (10 digits)"
         required: false
         default: ""
 
 jobs:
   fetch-and-predict:
     runs-on: ubuntu-latest
-    timeout-minutes: 120     # Hard cap — covers ~7,200 receipts at 1 req/sec
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repo
@@ -34,19 +34,16 @@ jobs:
 
       - name: Run fetch_cases.py
         env:
-          SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
-          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Range defaults live here — override via secrets or manual dispatch inputs
+          DATABASE_URL:       ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           IOE_START: ${{ github.event.inputs.ioe_start || secrets.IOE_START || '2490100001' }}
-          IOE_END:   ${{ github.event.inputs.ioe_end   || secrets.IOE_END   || '2490199999' }}
+          IOE_END:   ${{ github.event.inputs.ioe_end   || secrets.IOE_END   || '2490100050' }}
         run: python fetch_cases.py
 
       - name: Run predict.py
         env:
-          SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
-          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+          DATABASE_URL:       ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python predict.py
