@@ -3,36 +3,27 @@ import time
 import requests
 import pandas as pd
 from datetime import datetime, timezone
-from supabase import create_client
 from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
 
 load_dotenv()
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-TG_TOKEN     = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
+TG_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
+TG_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+DATABASE_URL = os.environ["DATABASE_URL"]   # postgresql://postgres:PASSWORD@db.xxx.supabase.co:5432/postgres
 
-# ── Receipt range config ───────────────────────────────────────────────────
-# Format: IOE + 2-digit year + 2-digit week + 6-digit sequence
-# Example: IOE2490100001 = year 24, week 90 (USCIS internal), seq 000001
-# Adjust these two values to define your search window.
 IOE_PREFIX = "IOE"
-IOE_START  = int(os.environ.get("IOE_START", "2490100001"))  # 10-digit suffix
-IOE_END    = int(os.environ.get("IOE_END",   "2490199999"))  # inclusive
+IOE_START  = int(os.environ.get("IOE_START", "2490100001"))
+IOE_END    = int(os.environ.get("IOE_END",   "2490100050"))
 
-RATE_DELAY  = 1.0  # seconds between requests — do not go below 0.5
+RATE_DELAY  = 1.0
 MAX_RETRIES = 3
-
 USCIS_URL   = "https://egov.uscis.gov/case-status/api/cases/{}"
 
-# ── DACA-specific status taxonomy ─────────────────────────────────────────
-# Each status maps to: (emoji, alert_tier, pipeline_score)
-#   alert_tier 1 = immediate individual alert
-#   alert_tier 2 = included in run summary only
-#   pipeline_score used by predict.py for ML features
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+# ── DACA status taxonomy ───────────────────────────────────────────────────
 DACA_STATUSES = {
-    # ── Positive / forward movement ────────────────────────────────────────
     "case was approved":                          ("✅", 1, 9),
     "card is being produced":                     ("🖨️",  1, 8),
     "card was mailed":                            ("📬", 1, 9),
@@ -44,62 +35,119 @@ DACA_STATUSES = {
     "fingerprints were taken":                    ("🔍", 2, 5),
     "case is being actively reviewed":            ("⚙️",  2, 6),
     "interview was scheduled":                    ("📅", 1, 7),
-
-    # ── Needs attention ────────────────────────────────────────────────────
     "request for evidence":                       ("⚠️", 1, 3),
-    "rfe":                                        ("⚠️", 1, 3),
     "response to request for evidence received":  ("📨", 1, 4),
     "notice of intent to deny":                   ("🚨", 1, 2),
-    "noid":                                       ("🚨", 1, 2),
-
-    # ── Negative outcomes ──────────────────────────────────────────────────
     "case was denied":                            ("❌", 1, 0),
     "rejected":                                   ("🚫", 1, 0),
     "administratively closed":                    ("🗂️",  1, 1),
     "terminated":                                 ("🛑", 1, 0),
     "withdrawn":                                  ("↩️", 2, 0),
-
-    # ── Neutral / early pipeline ───────────────────────────────────────────
     "case was received":                          ("📥", 2, 1),
     "case was updated":                           ("🔄", 2, 2),
-    "name was updated":                           ("✏️",  2, 2),
-    "fees were waived":                           ("💸", 2, 2),
     "fees were received":                         ("💰", 2, 2),
 }
 
-APPROVAL_KEYWORDS = [
+APPROVAL_KW = [
     "approved", "card was mailed", "card is being produced",
-    "card was delivered", "employment authorization document approved",
-    "renewal approved",
+    "card was delivered", "employment authorization document approved", "renewal approved",
 ]
 
-def match_status(raw_status: str) -> tuple:
-    """Return (emoji, alert_tier, pipeline_score) for a raw USCIS status string."""
-    s = raw_status.lower()
+def match_status(raw: str) -> tuple:
+    s = raw.lower()
     for kw, vals in DACA_STATUSES.items():
         if kw in s:
             return vals
-    return ("🔄", 2, 2)  # default: neutral update, include in summary
+    return ("🔄", 2, 2)
 
-def is_daca_case(data: dict) -> bool:
-    """Return True only if the API response is for Form I-821D."""
-    cs = data.get("case_status", {})
-    form = cs.get("form_type", "").upper()
-    return "821" in form or "I821" in form or form == ""  # "" = form unknown, still process
+def is_daca(data: dict) -> bool:
+    form = data.get("case_status", {}).get("form_type", "").upper()
+    return "821" in form or form == ""
 
-def is_approved(status: str) -> bool:
-    s = status.lower()
-    return any(kw in s for kw in APPROVAL_KEYWORDS)
+# ── DB helpers ─────────────────────────────────────────────────────────────
+def init_db():
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS cases (
+                receipt_number  TEXT PRIMARY KEY,
+                form_type       TEXT DEFAULT 'I-821D',
+                service_center  TEXT DEFAULT 'IOE',
+                last_status     TEXT,
+                pipeline_score  INTEGER DEFAULT 0,
+                action_date     TEXT,
+                updated_at      TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS status_log (
+                id              BIGSERIAL PRIMARY KEY,
+                receipt_number  TEXT NOT NULL,
+                status          TEXT,
+                pipeline_score  INTEGER DEFAULT 0,
+                description     TEXT,
+                action_date     TEXT,
+                fetched_at      TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS predictions (
+                receipt_number      TEXT PRIMARY KEY,
+                est_days_remaining  INTEGER,
+                est_total_days      INTEGER,
+                model_mae_days      FLOAT,
+                confidence          FLOAT,
+                had_rfe             BOOLEAN DEFAULT FALSE,
+                is_renewal          BOOLEAN DEFAULT FALSE,
+                predicted_at        TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_log_receipt
+                ON status_log (receipt_number, fetched_at DESC)
+        """))
+    print("[db] Schema ready.")
+
+def get_last_status(conn, receipt: str) -> str | None:
+    row = conn.execute(
+        text("SELECT status FROM status_log WHERE receipt_number=:r ORDER BY fetched_at DESC LIMIT 1"),
+        {"r": receipt}
+    ).fetchone()
+    return row[0] if row else None
+
+def upsert_case(conn, c: dict):
+    conn.execute(text("""
+        INSERT INTO cases (receipt_number, form_type, service_center, last_status,
+                           pipeline_score, action_date, updated_at)
+        VALUES (:receipt, :form, :sc, :status, :score, :action_date, :ts)
+        ON CONFLICT (receipt_number) DO UPDATE SET
+            last_status    = EXCLUDED.last_status,
+            pipeline_score = EXCLUDED.pipeline_score,
+            action_date    = EXCLUDED.action_date,
+            updated_at     = EXCLUDED.updated_at
+    """), {
+        "receipt": c["receipt_number"], "form": c["form_type"],
+        "sc": c["service_center"],      "status": c["status"],
+        "score": c["pipeline_score"],   "action_date": c["action_date"],
+        "ts": c["fetched_at"],
+    })
+
+def insert_log(conn, c: dict):
+    conn.execute(text("""
+        INSERT INTO status_log (receipt_number, status, pipeline_score,
+                                description, action_date, fetched_at)
+        VALUES (:receipt, :status, :score, :desc, :action_date, :ts)
+    """), {
+        "receipt": c["receipt_number"], "status": c["status"],
+        "score": c["pipeline_score"],   "desc": c["description"],
+        "action_date": c["action_date"], "ts": c["fetched_at"],
+    })
 
 # ── Telegram ───────────────────────────────────────────────────────────────
 def send_telegram(msg: str):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
-        r = requests.post(
-            url,
-            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=10,
-        )
+        r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": msg,
+                                     "parse_mode": "HTML"}, timeout=10)
         r.raise_for_status()
     except Exception as e:
         print(f"[Telegram] {e}")
@@ -108,113 +156,57 @@ def send_telegram(msg: str):
 def fetch_case(receipt: str) -> dict | None:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = requests.get(
-                USCIS_URL.format(receipt),
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=15,
-            )
+            r = requests.get(USCIS_URL.format(receipt),
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
             if r.status_code == 429:
-                wait = 30 * attempt
-                print(f"  [{receipt}] Rate limited — waiting {wait}s")
-                time.sleep(wait)
+                time.sleep(30 * attempt)
                 continue
             if r.status_code == 404:
-                return None  # receipt doesn't exist, skip silently
+                return None
             r.raise_for_status()
             data = r.json()
-
-            if not is_daca_case(data):
-                print(f"  [{receipt}] Skipped — not an I-821D case")
+            if not is_daca(data):
                 return None
-
-            cs = data.get("case_status", {})
-            raw_status = cs.get("current_case_status_text_en", "Unknown")
-            emoji, alert_tier, score = match_status(raw_status)
-
+            cs    = data.get("case_status", {})
+            raw   = cs.get("current_case_status_text_en", "Unknown")
+            emoji, tier, score = match_status(raw)
             return {
                 "receipt_number": receipt,
                 "form_type":      cs.get("form_type", "I-821D"),
-                "status":         raw_status,
+                "status":         raw,
                 "status_emoji":   emoji,
-                "alert_tier":     alert_tier,
+                "alert_tier":     tier,
                 "pipeline_score": score,
-                "action_date":    cs.get("case_status_date", None),
+                "action_date":    cs.get("case_status_date"),
                 "description":    cs.get("current_case_status_desc_en", ""),
                 "service_center": "IOE",
                 "fetched_at":     datetime.now(timezone.utc).isoformat(),
             }
         except Exception as e:
-            print(f"  [{receipt}] Attempt {attempt} error: {e}")
+            print(f"  [{receipt}] attempt {attempt}: {e}")
             time.sleep(5 * attempt)
     return None
 
-# ── Supabase helpers ───────────────────────────────────────────────────────
-sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-def get_last_status(receipt: str) -> str | None:
-    res = (
-        sb.table("status_log")
-        .select("status")
-        .eq("receipt_number", receipt)
-        .order("fetched_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    return res.data[0]["status"] if res.data else None
-
-def upsert_case(c: dict):
-    sb.table("cases").upsert(
-        {
-            "receipt_number": c["receipt_number"],
-            "form_type":      c["form_type"],
-            "service_center": c["service_center"],
-            "last_status":    c["status"],
-            "pipeline_score": c["pipeline_score"],
-            "action_date":    c["action_date"],
-            "updated_at":     c["fetched_at"],
-        },
-        on_conflict="receipt_number",
-    ).execute()
-
-def insert_log(c: dict):
-    sb.table("status_log").insert(
-        {
-            "receipt_number": c["receipt_number"],
-            "status":         c["status"],
-            "pipeline_score": c["pipeline_score"],
-            "description":    c["description"],
-            "action_date":    c["action_date"],
-            "fetched_at":     c["fetched_at"],
-        }
-    ).execute()
-
-# ── Range generator ────────────────────────────────────────────────────────
-def generate_receipts(prefix: str, start: int, end: int) -> list[str]:
-    """Generate IOE receipt numbers for the given numeric suffix range."""
+def generate_receipts(prefix, start, end):
     return [f"{prefix}{str(n).zfill(10)}" for n in range(start, end + 1)]
 
 # ── Main ───────────────────────────────────────────────────────────────────
 def main():
-    receipts = generate_receipts(IOE_PREFIX, IOE_START, IOE_END)
+    init_db()
 
-    # Also merge any manual receipts.csv if it exists (optional override)
+    receipts = generate_receipts(IOE_PREFIX, IOE_START, IOE_END)
     try:
-        df_manual = pd.read_csv("receipts.csv", dtype=str)
-        extras = df_manual["receipt_number"].str.strip().dropna().tolist()
-        # Deduplicate
+        extras = pd.read_csv("receipts.csv", dtype=str)["receipt_number"].dropna().tolist()
         receipts = list(dict.fromkeys(receipts + extras))
-        print(f"[fetch_cases] Merged {len(extras)} manual receipts from receipts.csv")
+        print(f"[fetch] Merged {len(extras)} from receipts.csv")
     except FileNotFoundError:
         pass
 
     total   = len(receipts)
-    success = 0
-    skipped = 0
-    failed  = 0
-    changed = 0
-    changes = []  # tier-1 alert summaries for final report
+    success = skipped = failed = changed = 0
+    changes = []
 
-    print(f"[fetch_cases] Scanning {total} IOE receipts ({IOE_PREFIX}{IOE_START}–{IOE_PREFIX}{IOE_END})")
+    print(f"[fetch] Scanning {total} receipts: {IOE_PREFIX}{IOE_START} → {IOE_PREFIX}{IOE_END}")
     send_telegram(
         f"🚀 <b>USCIS 821-D Fetch Started</b>\n"
         f"📋 Scanning <b>{total:,}</b> IOE receipts\n"
@@ -223,81 +215,65 @@ def main():
 
     start_time = time.time()
 
-    for i, receipt in enumerate(receipts, 1):
-        case = fetch_case(receipt)
+    with engine.begin() as conn:
+        for i, receipt in enumerate(receipts, 1):
+            case = fetch_case(receipt)
 
-        if case is None:
-            skipped += 1
-            if i % 500 == 0:
-                print(f"  [{i}/{total}] ... (last skipped/failed)")
-        else:
-            prev_status = get_last_status(receipt)
-            upsert_case(case)
-            insert_log(case)
-            success += 1
-
-            emoji       = case["status_emoji"]
-            status_short = case["status"][:70]
-            tier        = case["alert_tier"]
-
-            if prev_status is None:
-                # First time we've seen this receipt with a real status
-                print(f"  [{i}/{total}] {receipt} NEW → {status_short}")
-                if tier == 1:
-                    changes.append(f"{emoji} <code>{receipt}</code> — NEW: {status_short}")
-                    changed += 1
-
-            elif prev_status != case["status"]:
-                changed += 1
-                _, new_tier, _ = match_status(case["status"])
-
-                if new_tier == 1:
-                    # Fire immediate individual alert
-                    send_telegram(
-                        f"🔔 <b>DACA Status Change</b>\n"
-                        f"Receipt: <code>{receipt}</code>\n"
-                        f"From: {prev_status}\n"
-                        f"To:   {emoji} {status_short}\n"
-                        f"Date: {case['action_date'] or 'N/A'}"
-                    )
-                changes.append(f"↕️ <code>{receipt}</code> → {emoji} {status_short}")
-                print(f"  [{i}/{total}] {receipt} CHANGED → {status_short}")
+            if case is None:
+                skipped += 1
             else:
-                print(f"  [{i}/{total}] {receipt} — no change")
+                prev = get_last_status(conn, receipt)
+                upsert_case(conn, case)
+                insert_log(conn, case)
+                success += 1
 
-        # Progress ping every 500 receipts
-        if i % 500 == 0:
-            elapsed = int(time.time() - start_time)
-            send_telegram(
-                f"⏳ <b>Progress update</b>\n"
-                f"{i:,} / {total:,} receipts scanned\n"
-                f"✅ Found: {success} · ↕️ Changed: {changed} · ⏭ Skipped: {skipped}\n"
-                f"⏱ Elapsed: {elapsed // 60}m {elapsed % 60}s"
-            )
+                emoji = case["status_emoji"]
+                short = case["status"][:70]
 
-        time.sleep(RATE_DELAY)
+                if prev is None:
+                    if case["alert_tier"] == 1:
+                        changes.append(f"{emoji} <code>{receipt}</code> — NEW: {short}")
+                        changed += 1
+                elif prev != case["status"]:
+                    changed += 1
+                    if case["alert_tier"] == 1:
+                        send_telegram(
+                            f"🔔 <b>DACA Status Change</b>\n"
+                            f"Receipt: <code>{receipt}</code>\n"
+                            f"From: {prev}\n"
+                            f"To:   {emoji} {short}\n"
+                            f"Date: {case['action_date'] or 'N/A'}"
+                        )
+                    changes.append(f"↕️ <code>{receipt}</code> → {emoji} {short}")
+
+            if i % 500 == 0:
+                elapsed = int(time.time() - start_time)
+                send_telegram(
+                    f"⏳ <b>Progress</b>: {i:,}/{total:,}\n"
+                    f"✅ {success} · ↕️ {changed} · ⏭ {skipped}\n"
+                    f"⏱ {elapsed//60}m {elapsed%60}s"
+                )
+
+            time.sleep(RATE_DELAY)
 
     elapsed = int(time.time() - start_time)
-    mins, secs = elapsed // 60, elapsed % 60
-
     summary = [
-        f"✅ <b>USCIS 821-D Fetch Complete</b>",
-        f"",
+        f"✅ <b>Fetch Complete</b>", "",
         f"📋 Scanned:  <b>{total:,}</b>",
-        f"✅ Found:    <b>{success:,}</b> active I-821D cases",
+        f"✅ Found:    <b>{success:,}</b>",
         f"↕️ Changed:  <b>{changed}</b>",
-        f"⏭ Skipped:  <b>{skipped:,}</b> (404 / non-DACA)",
-        f"⏱ Duration: <b>{mins}m {secs}s</b>",
+        f"⏭ Skipped:  <b>{skipped:,}</b>",
+        f"⏱ Duration: <b>{elapsed//60}m {elapsed%60}s</b>",
     ]
     if changes:
-        summary += ["", "<b>Notable changes this run:</b>"]
+        summary += ["", "<b>Changes this run:</b>"]
         for line in changes[:25]:
             summary.append(f"  {line}")
         if len(changes) > 25:
-            summary.append(f"  ... and {len(changes) - 25} more")
+            summary.append(f"  ... and {len(changes)-25} more")
 
     send_telegram("\n".join(summary))
-    print(f"\n[fetch_cases] Done. {success}/{total} found, {changed} changed, {skipped} skipped.")
+    print(f"[fetch] Done. {success}/{total} found, {changed} changed, {skipped} skipped.")
 
 if __name__ == "__main__":
     main()
