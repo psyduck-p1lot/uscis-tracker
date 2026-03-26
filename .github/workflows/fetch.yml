@@ -1,14 +1,23 @@
-name: USCIS Daily Fetch
+name: USCIS 821-D Daily Fetch
 
 on:
   schedule:
     - cron: "0 10 * * *"   # Daily 10:00 AM UTC
-  workflow_dispatch:         # Allow manual trigger from GitHub UI
+  workflow_dispatch:         # Manual trigger from GitHub Actions UI
+    inputs:
+      ioe_start:
+        description: "IOE suffix start (10 digits, e.g. 2490100001)"
+        required: false
+        default: ""
+      ioe_end:
+        description: "IOE suffix end (10 digits, e.g. 2490199999)"
+        required: false
+        default: ""
 
 jobs:
   fetch-and-predict:
     runs-on: ubuntu-latest
-    timeout-minutes: 120     # Hard stop at 2 hours (covers up to ~7,200 receipts)
+    timeout-minutes: 120     # Hard cap — covers ~7,200 receipts at 1 req/sec
 
     steps:
       - name: Checkout repo
@@ -29,6 +38,9 @@ jobs:
           SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
           TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Range defaults live here — override via secrets or manual dispatch inputs
+          IOE_START: ${{ github.event.inputs.ioe_start || secrets.IOE_START || '2490100001' }}
+          IOE_END:   ${{ github.event.inputs.ioe_end   || secrets.IOE_END   || '2490199999' }}
         run: python fetch_cases.py
 
       - name: Run predict.py
